@@ -36,3 +36,10 @@ references. drp/0.1 has no known external adopters, so the
 tightening lands in-place rather than as a version bump; from the
 next change onward, verifier semantics changes will version. The
 four canonical vectors pass strict mode; SHA256SUMS unchanged.
+
+Note: the superseded vector generation also violated
+schemas/decision_record.schema.json — records omitted the required
+`request_id` field, which the 6-check verifier could not detect
+(it did not enforce field sets). The current pinned generation is
+schema-conformant; the strict verifier's field-set check makes this
+class of schema/vector disagreement impossible to reintroduce.
