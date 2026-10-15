@@ -59,10 +59,25 @@ report which agents are anchored.
 | Forge an execution result | anchor mismatch |
 | Two executions for one decision | one-execution-per-decision check |
 | Runtime says BLOCK, action ran anyway | ENFORCEMENT DIVERGENCE |
+| Rewrite or delete an execution event and re-hash it | with `--envelopes` + `--trusted-key`: every decision **and execution event** needs a valid envelope from a trusted key |
+| Two readings of one line (duplicate JSON keys) | duplicate keys rejected |
+| Hand over an empty or wrong file | an export with no records fails |
 
-`tools/verify_records.py` is standard-library-only Python and imports
-no producing runtime — verification requires zero trust in the code
-being audited.
+`tools/verify_records.py` imports no producing runtime: chain checks use
+only the Python standard library, and signature checks add PyNaCl. That
+removes trust in the runtime's *code*, not every assumption. What the
+verifier does **not** establish:
+
+- **Who the keys belong to.** A valid signature proves the record was
+  attested by the holder of a key you chose to trust. Whether that key
+  belongs to the right party is an out-of-band decision.
+- **Completeness at the tail.** Deleting the newest records of a chain
+  (with their envelopes) is not detectable from the file alone; compare
+  against an independently held head, e.g. a signed export manifest.
+- **Legacy exports.** Files produced before execution events were signed
+  can be checked with `--allow-unsigned-executions`; in that mode a
+  rewritten execution event is detectable only by its hash, not its
+  signature.
 
 ## Test vectors
 

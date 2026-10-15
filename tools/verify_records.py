@@ -2,7 +2,9 @@
 """
 Independent verifier for decision/execution JSONL audit files.
 
-Uses ONLY the Python standard library and does NOT import agent_dna.
+Chain verification uses only the Python standard library and does not
+import agent_dna. Trusted signature verification is optional and requires
+PyNaCl, the same maintained Ed25519 implementation used by the signer.
 
 Checks:
   1.  Every line is strict JSON (NaN/Infinity rejected).
@@ -27,7 +29,9 @@ Checks:
       decision), and exactly one "follows" edge must target it. A null
       parent_decision forbids "follows" edges.
   7.  Enums: decision in {allow, require_approval, block}; execution
-      status in {ok, error, refused}.
+      status in {ok, error, refused, indeterminate}.
+      Optional response_digest (sha256:<hex>) is allowed on execution
+      events and is hashed with the payload when present.
   8.  kind=="execution": prev_hash equals the referenced decision's
       record_hash; the decision must appear earlier; the execution's
       agent_id must equal the decision's; at most one execution per
@@ -35,11 +39,21 @@ Checks:
   9.  ENFORCEMENT DIVERGENCE: an execution with status "ok" whose
       decision was "block" fails -- the runtime refused and the world
       executed anyway.
+  10. When detached envelopes and trusted keys are supplied, every decision
+      AND every execution event must have exactly one valid Ed25519
+      envelope signed by a trusted key. (--allow-unsigned-executions
+      relaxes this for legacy exports; signed ones are still checked.)
+  11. Duplicate JSON object keys are rejected, and an export with no
+      records fails.
 
 Exit codes: 0 pass, 1 fail, 2 usage.
-Usage: python3 verify_records.py <records.jsonl>
+Usage:
+  python3 verify_records.py <records.jsonl>
+  python3 verify_records.py <records.jsonl> \
+      --envelopes <envelopes.jsonl> --trusted-key <public-key-hex>
 """
 
+import argparse
 import hashlib
 import json
 import re
@@ -48,24 +62,89 @@ import sys
 GENESIS_HASH = "0" * 64
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 
-DECISION_FIELDS = frozenset({
-    "kind", "protocol_version", "decision_id", "parent_decision",
-    "agent_id", "capability", "decision", "triggered_by", "reason",
-    "severity", "drift_score", "evidence", "evidence_strength",
-    "arguments_digest", "outcome", "request_id", "goal", "intent",
-    "policy_id", "approval_ref", "receipt_ref", "edges", "timestamp",
-    "prev_hash", "record_hash",
-})
-EXECUTION_FIELDS = frozenset({
-    "kind", "protocol_version", "event_id", "agent_id", "decision_ref",
-    "status", "detail", "edges", "timestamp", "prev_hash", "record_hash",
-})
+DECISION_FIELDS_COMMON = frozenset(
+    {
+        "kind",
+        "protocol_version",
+        "decision_id",
+        "parent_decision",
+        "agent_id",
+        "capability",
+        "decision",
+        "triggered_by",
+        "reason",
+        "severity",
+        "drift_score",
+        "evidence",
+        "evidence_strength",
+        "arguments_digest",
+        "outcome",
+        "request_id",
+        "goal",
+        "intent",
+        "policy_id",
+        "approval_ref",
+        "receipt_ref",
+        "edges",
+        "timestamp",
+        "prev_hash",
+        "record_hash",
+    }
+)
+# drp/0.1: audit-only; digests must be absent.
+DECISION_FIELDS_V01 = DECISION_FIELDS_COMMON
+# drp/0.2: mintable; both digests required (derive-only at seal time).
+DECISION_FIELDS_V02 = DECISION_FIELDS_COMMON | {
+    "action_digest",
+    "dispatch_context_digest",
+}
+# Back-compat alias for importers/tests that still name DECISION_FIELDS.
+DECISION_FIELDS = DECISION_FIELDS_V01
+SHA256_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+EXECUTION_FIELDS = frozenset(
+    {
+        "kind",
+        "protocol_version",
+        "event_id",
+        "agent_id",
+        "decision_ref",
+        "status",
+        "detail",
+        "edges",
+        "timestamp",
+        "prev_hash",
+        "record_hash",
+    }
+)
 DECISION_ENUM = {"allow", "require_approval", "block"}
-STATUS_ENUM = {"ok", "error", "refused"}
+STATUS_ENUM = {"ok", "error", "refused", "indeterminate"}
+EXECUTION_OPTIONAL_FIELDS = frozenset({"response_digest"})
+ENVELOPE_FIELDS = frozenset(
+    {
+        "envelope_id",
+        "algorithm",
+        "signed_hash",
+        "signature",
+        "public_key",
+        "key_id",
+    }
+)
+HEX128 = re.compile(r"[0-9a-f]{128}\Z")
 
 
 def _reject_nonfinite(token):
     raise ValueError(f"non-finite number {token!r} is not valid JSON")
+
+
+def _reject_duplicate_keys(pairs):
+    # json.loads keeps the LAST duplicate; grep/log viewers see the
+    # first. One signature must never cover two readings of a line.
+    obj = {}
+    for key, value in pairs:
+        if key in obj:
+            raise ValueError(f"duplicate key {key!r}")
+        obj[key] = value
+    return obj
 
 
 def compute_hash(record: dict) -> str:
@@ -74,16 +153,204 @@ def compute_hash(record: dict) -> str:
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
-def verify(path: str) -> int:
+def _trusted_key(value: str) -> str:
+    if not HEX64.match(value):
+        raise argparse.ArgumentTypeError(
+            "trusted keys must be 64 lowercase hexadecimal characters"
+        )
+    return value
+
+
+def _verify_envelopes(  # noqa: C901 - ordered validation checklist
+    path: str,
+    trusted_keys: frozenset[str],
+    decision_hashes: set[str],
+    execution_hashes: set[str] | None = None,
+    require_execution_envelopes: bool = True,
+) -> tuple[list[str], dict[str, int]]:
+    execution_hashes = execution_hashes or set()
     failures = []
-    chains = {}            # agent_id -> expected prev_hash (decisions)
-    anchored = {}          # agent_id -> anchor hash (non-genesis origins)
-    decisions = {}         # decision_id -> {"hash","decision","agent"} (first occurrence)
+    stats = {
+        "checked": 0,
+        "valid": 0,
+        "missing": 0,
+        "invalid": 0,
+        "untrusted": 0,
+        "unexpected": 0,
+    }
+
+    try:
+        from nacl.encoding import HexEncoder
+        from nacl.exceptions import BadSignatureError
+        from nacl.signing import VerifyKey
+    except ImportError:
+        failures.append("trusted signature verification requires PyNaCl")
+        return failures, stats
+
+    seen_hashes = set()
+    envelope_ids = set()
+
+    with open(path, encoding="utf-8") as source:
+        for lineno, line in enumerate(source, 1):
+            line = line.strip()
+            if not line:
+                continue
+
+            stats["checked"] += 1
+
+            try:
+                envelope = json.loads(
+                    line,
+                    parse_constant=_reject_nonfinite,
+                    object_pairs_hook=_reject_duplicate_keys,
+                )
+            except ValueError as exc:
+                failures.append(f"envelopes line {lineno}: invalid JSON ({exc})")
+                stats["invalid"] += 1
+                continue
+
+            if not isinstance(envelope, dict):
+                failures.append(f"envelopes line {lineno}: expected a JSON object")
+                stats["invalid"] += 1
+                continue
+
+            unknown = set(envelope) - ENVELOPE_FIELDS
+            missing = ENVELOPE_FIELDS - set(envelope)
+
+            if unknown:
+                failures.append(
+                    f"envelopes line {lineno}: unknown field(s) {sorted(unknown)}"
+                )
+            if missing:
+                failures.append(
+                    f"envelopes line {lineno}: missing field(s) {sorted(missing)}"
+                )
+                stats["invalid"] += 1
+                continue
+
+            envelope_id = envelope["envelope_id"]
+            if not isinstance(envelope_id, str) or not envelope_id:
+                failures.append(f"envelopes line {lineno}: invalid envelope_id")
+                stats["invalid"] += 1
+            elif envelope_id in envelope_ids:
+                failures.append(
+                    f"envelopes line {lineno}: duplicate envelope_id {envelope_id!r}"
+                )
+                stats["invalid"] += 1
+            else:
+                envelope_ids.add(envelope_id)
+
+            if envelope["algorithm"] != "Ed25519":
+                failures.append(
+                    f"envelopes line {lineno}: unsupported algorithm "
+                    f"{envelope['algorithm']!r}"
+                )
+                stats["invalid"] += 1
+                continue
+
+            signed_hash = envelope["signed_hash"]
+            if not isinstance(signed_hash, str) or not HEX64.match(signed_hash):
+                failures.append(
+                    f"envelopes line {lineno}: signed_hash is not 64 lowercase hex"
+                )
+                stats["invalid"] += 1
+                continue
+
+            if signed_hash in seen_hashes:
+                failures.append(
+                    f"envelopes line {lineno}: duplicate envelope for "
+                    f"decision hash {signed_hash}"
+                )
+                stats["invalid"] += 1
+                continue
+            seen_hashes.add(signed_hash)
+
+            if signed_hash not in decision_hashes | execution_hashes:
+                failures.append(
+                    f"envelopes line {lineno}: envelope references "
+                    f"unknown decision hash {signed_hash}"
+                )
+                stats["unexpected"] += 1
+                continue
+
+            public_key = envelope["public_key"]
+            signature = envelope["signature"]
+
+            if not isinstance(public_key, str) or not HEX64.match(public_key):
+                failures.append(
+                    f"envelopes line {lineno}: public_key is not 64 lowercase hex"
+                )
+                stats["invalid"] += 1
+                continue
+
+            if not isinstance(signature, str) or not HEX128.match(signature):
+                failures.append(
+                    f"envelopes line {lineno}: signature is not 128 lowercase hex"
+                )
+                stats["invalid"] += 1
+                continue
+
+            key_id = envelope["key_id"]
+            if key_id is not None and not isinstance(key_id, str):
+                failures.append(
+                    f"envelopes line {lineno}: key_id must be a string or null"
+                )
+                stats["invalid"] += 1
+                continue
+
+            if public_key not in trusted_keys:
+                failures.append(
+                    f"envelopes line {lineno}: untrusted public key {public_key}"
+                )
+                stats["untrusted"] += 1
+                continue
+
+            try:
+                VerifyKey(
+                    public_key,
+                    encoder=HexEncoder,
+                ).verify(
+                    signed_hash.encode(),
+                    bytes.fromhex(signature),
+                )
+            except (BadSignatureError, ValueError):
+                failures.append(f"envelopes line {lineno}: invalid Ed25519 signature")
+                stats["invalid"] += 1
+            else:
+                stats["valid"] += 1
+
+    missing_hashes = sorted(decision_hashes - seen_hashes)
+    missing_exec = (
+        sorted(execution_hashes - seen_hashes) if require_execution_envelopes else []
+    )
+    stats["missing"] = len(missing_hashes) + len(missing_exec)
+
+    for signed_hash in missing_hashes:
+        failures.append(f"missing envelope for decision hash {signed_hash}")
+    for signed_hash in missing_exec:
+        failures.append(f"missing envelope for execution hash {signed_hash}")
+
+    return failures, stats
+
+
+def verify(  # noqa: C901 - mirrors the protocol check order
+    path: str,
+    *,
+    envelopes_path: str | None = None,
+    trusted_keys: frozenset[str] | None = None,
+    allow_unsigned_executions: bool = False,
+) -> int:
+    failures = []
+    chains = {}  # agent_id -> expected prev_hash (decisions)
+    anchored = {}  # agent_id -> anchor hash (non-genesis origins)
+    decisions = {}  # decision_id -> {"hash","decision","agent"} (first occurrence)
+    decision_hashes = set()  # hashes requiring signature envelopes
+    execution_hashes = set()  # execution hashes (signed since v-next)
     event_ids = set()
-    executed = set()       # decision_ids with an execution event
+    executed = set()  # decision_ids with an execution event
     total = 0
 
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         for lineno, line in enumerate(f, 1):
             line = line.strip()
             if not line:
@@ -91,23 +358,55 @@ def verify(path: str) -> int:
             total += 1
 
             try:
-                rec = json.loads(line, parse_constant=_reject_nonfinite)
+                rec = json.loads(
+                    line,
+                    parse_constant=_reject_nonfinite,
+                    object_pairs_hook=_reject_duplicate_keys,
+                )
             except ValueError as e:
                 failures.append(f"line {lineno}: invalid JSON ({e})")
                 continue
 
             pv = rec.get("protocol_version")
-            if pv != "drp/0.1":
-                failures.append(
-                    f"line {lineno}: protocol_version {pv!r} is not drp/0.1"
-                )
-
             kind = rec.get("kind", "decision")
-            expected_fields = (
-                DECISION_FIELDS if kind == "decision"
-                else EXECUTION_FIELDS if kind == "execution"
-                else None
-            )
+            if kind == "decision":
+                if pv == "drp/0.1":
+                    expected_fields = DECISION_FIELDS_V01
+                elif pv == "drp/0.2":
+                    expected_fields = DECISION_FIELDS_V02
+                else:
+                    failures.append(
+                        f"line {lineno}: protocol_version {pv!r} is not "
+                        "drp/0.1 or drp/0.2"
+                    )
+                    expected_fields = DECISION_FIELDS_V01
+            elif kind == "execution":
+                extra = set(rec) - EXECUTION_FIELDS
+                unknown = extra - EXECUTION_OPTIONAL_FIELDS
+                missing = EXECUTION_FIELDS - set(rec)
+                expected_fields = EXECUTION_FIELDS | (extra & EXECUTION_OPTIONAL_FIELDS)
+                if pv != "drp/0.1":
+                    failures.append(
+                        f"line {lineno}: protocol_version {pv!r} is not drp/0.1"
+                    )
+                if unknown:
+                    failures.append(
+                        f"line {lineno}: unknown field(s) {sorted(unknown)}"
+                    )
+                if missing:
+                    failures.append(
+                        f"line {lineno}: missing field(s) {sorted(missing)}"
+                    )
+                    continue
+                digest = rec.get("response_digest")
+                if digest is not None and not SHA256_DIGEST.match(str(digest)):
+                    failures.append(
+                        f"line {lineno}: response_digest is not sha256:<64 hex>"
+                    )
+                # Skip the generic field-set check below; we already applied it.
+                expected_fields = set(rec)
+            else:
+                expected_fields = None
             if expected_fields is None:
                 failures.append(f"line {lineno}: unknown kind {kind!r}")
                 continue
@@ -115,22 +414,24 @@ def verify(path: str) -> int:
             unknown = set(rec) - expected_fields
             missing = expected_fields - set(rec)
             if unknown:
-                failures.append(
-                    f"line {lineno}: unknown field(s) {sorted(unknown)}"
-                )
+                failures.append(f"line {lineno}: unknown field(s) {sorted(unknown)}")
             if missing:
-                failures.append(
-                    f"line {lineno}: missing field(s) {sorted(missing)}"
-                )
+                failures.append(f"line {lineno}: missing field(s) {sorted(missing)}")
                 continue
+
+            if kind == "decision" and pv == "drp/0.2":
+                for label in ("action_digest", "dispatch_context_digest"):
+                    digest = rec.get(label)
+                    if not isinstance(digest, str) or not SHA256_DIGEST.match(digest):
+                        failures.append(
+                            f"line {lineno}: {label} must be sha256:<64 hex>"
+                        )
 
             stored = rec.get("record_hash", "")
             prev = rec.get("prev_hash", "")
             for label, value in (("record_hash", stored), ("prev_hash", prev)):
                 if not isinstance(value, str) or not HEX64.match(value):
-                    failures.append(
-                        f"line {lineno}: {label} is not 64 lowercase hex"
-                    )
+                    failures.append(f"line {lineno}: {label} is not 64 lowercase hex")
 
             computed = compute_hash(rec)
             if stored != computed:
@@ -140,6 +441,9 @@ def verify(path: str) -> int:
                 )
 
             if kind == "decision":
+                if isinstance(stored, str) and HEX64.match(stored):
+                    decision_hashes.add(stored)
+
                 rid = rec.get("decision_id", f"<line {lineno}>")
                 agent = rec.get("agent_id", "<missing>")
 
@@ -159,19 +463,19 @@ def verify(path: str) -> int:
                 if agent in chains:
                     if prev != chains[agent]:
                         failures.append(
-                            f"line {lineno} [{rid}]: chain break for agent "
-                            f"{agent!r}"
+                            f"line {lineno} [{rid}]: chain break for agent {agent!r}"
                         )
                 else:
                     # first record for this agent establishes the origin
                     if prev != GENESIS_HASH:
-                        anchored[agent] = prev   # drp/0.1 anchor rule
+                        anchored[agent] = prev  # drp/0.1 anchor rule
                 chains[agent] = stored
 
                 # ---- lineage (P0-4) ----
                 parent = rec.get("parent_decision")
                 follows = [
-                    e for e in rec.get("edges", [])
+                    e
+                    for e in rec.get("edges", [])
                     if isinstance(e, dict) and e.get("type") == "follows"
                 ]
                 if parent is None:
@@ -214,13 +518,13 @@ def verify(path: str) -> int:
                 }
 
             else:  # execution
+                if isinstance(stored, str) and HEX64.match(stored):
+                    execution_hashes.add(stored)
                 eid = rec.get("event_id", f"<line {lineno}>")
                 dref = rec.get("decision_ref")
 
                 if eid in event_ids:
-                    failures.append(
-                        f"line {lineno} [{eid}]: duplicate event_id"
-                    )
+                    failures.append(f"line {lineno} [{eid}]: duplicate event_id")
                 event_ids.add(eid)
 
                 if rec.get("status") not in STATUS_ENUM:
@@ -254,10 +558,7 @@ def verify(path: str) -> int:
                         )
                     executed.add(dref)
 
-                    if (
-                        dinfo["decision"] == "block"
-                        and rec.get("status") == "ok"
-                    ):
+                    if dinfo["decision"] == "block" and rec.get("status") == "ok":
                         failures.append(
                             f"line {lineno} [{eid}]: ENFORCEMENT DIVERGENCE "
                             f"— decision {dref} was BLOCK but execution "
@@ -272,12 +573,39 @@ def verify(path: str) -> int:
                                 "target != decision_ref"
                             )
 
+    signature_stats = None
+    if envelopes_path is not None:
+        if not trusted_keys:
+            failures.append("signature verification requires at least one trusted key")
+        else:
+            envelope_failures, signature_stats = _verify_envelopes(
+                envelopes_path,
+                trusted_keys,
+                decision_hashes,
+                execution_hashes,
+                require_execution_envelopes=not allow_unsigned_executions,
+            )
+            failures.extend(envelope_failures)
+
+    if total == 0:
+        failures.append("export contains no records")
+
     print(f"records checked : {total}")
     print(f"agents          : {len(chains)}")
-    print(f"anchored agents : {len(anchored)}"
-          + (f" ({', '.join(sorted(anchored))})" if anchored else ""))
+    print(
+        f"anchored agents : {len(anchored)}"
+        + (f" ({', '.join(sorted(anchored))})" if anchored else "")
+    )
     print(f"decisions       : {len(decisions)}")
     print(f"executions      : {len(executed)}")
+    if signature_stats is not None:
+        print(f"envelopes checked: {signature_stats['checked']}")
+        print(f"trusted keys    : {len(trusted_keys or ())}")
+        print(f"valid envelopes : {signature_stats['valid']}")
+        print(f"missing envelopes: {signature_stats['missing']}")
+        print(f"invalid envelopes: {signature_stats['invalid']}")
+        print(f"untrusted keys  : {signature_stats['untrusted']}")
+        print(f"unexpected envs : {signature_stats['unexpected']}")
     print(f"failures        : {len(failures)}")
     for msg in failures:
         print(f"  FAIL {msg}")
@@ -285,8 +613,40 @@ def verify(path: str) -> int:
     return 0 if not failures else 1
 
 
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Verify a DRP audit record export.",
+    )
+    parser.add_argument("records", help="record JSONL export")
+    parser.add_argument(
+        "--envelopes",
+        help="detached signature envelope JSONL export",
+    )
+    parser.add_argument(
+        "--trusted-key",
+        action="append",
+        type=_trusted_key,
+        default=[],
+        help="trusted Ed25519 public key in hex; may be repeated",
+    )
+    parser.add_argument(
+        "--allow-unsigned-executions",
+        action="store_true",
+        help="legacy exports only: do not require envelopes on execution "
+        "events (ENFORCEMENT DIVERGENCE can then be erased by rehashing)",
+    )
+    args = parser.parse_args(argv)
+
+    if bool(args.envelopes) != bool(args.trusted_key):
+        parser.error("--envelopes and --trusted-key must be supplied together")
+
+    return verify(
+        args.records,
+        envelopes_path=args.envelopes,
+        trusted_keys=frozenset(args.trusted_key),
+        allow_unsigned_executions=args.allow_unsigned_executions,
+    )
+
+
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print(__doc__)
-        sys.exit(2)
-    sys.exit(verify(sys.argv[1]))
+    sys.exit(main())
