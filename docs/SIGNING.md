@@ -48,6 +48,22 @@ producer-gated field policy.
 A signature over a record that fails step 1 is meaningless and MUST
 be reported as a record failure, not a signature failure.
 
+## Rule 5 — Execution events are signed too
+
+An execution event is evidence of what happened after a decision; for a
+BLOCK it is the evidence that the block held. A conforming producer signs
+every execution event exactly like a decision (Rule 1 over its own
+`record_hash`). A conforming verifier in trusted mode MUST require one
+valid envelope from a trusted key for every decision AND every execution
+event. Rationale: an unsigned execution event can be rewritten (e.g.
+status `ok` to `refused`) and re-hashed by anyone holding the file,
+erasing an enforcement divergence.
+
+## Rule 6 — Trust comes from configuration, never from the envelope
+
+The `public_key` inside an envelope is a hint, not a trust root. Verifiers
+MUST check signatures only against keys the auditor supplied out of band.
+
 ## Legacy formats
 
 Pre-DRP receipt formats (line-concatenation chains, digests excluding

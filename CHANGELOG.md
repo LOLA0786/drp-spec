@@ -1,3 +1,25 @@
+## drp/0.1 — verifier: signed execution events, trusted signatures (2026-10-16)
+
+`tools/verify_records.py` is synced byte-for-byte from the reference
+runtime (privatevault-agent-dna, tests pin its SHA-256). Changes:
+
+- **Trusted signature mode** (`--envelopes <file> --trusted-key <hex>`,
+  repeatable): every record needs exactly one valid Ed25519 envelope from a
+  trusted key; keys embedded in envelopes are never trusted on their own.
+  Supersedes the unmerged `hardening/trusted-signature-verifier` branch.
+- **Execution events must be signed** in trusted mode. Without this, a
+  BLOCK whose action ran anyway could be erased by rewriting the execution
+  event's status and recomputing its hash. Legacy exports:
+  `--allow-unsigned-executions`.
+- **Duplicate JSON keys are rejected** (one signature must not cover two
+  readings of a line).
+- **An empty export fails.**
+- Execution status `indeterminate` and optional `response_digest` are
+  recognised.
+
+Chain-only mode (no flags) is unchanged for the committed vectors:
+`clean` passes; `tampered_field`, `deleted_record`, `divergent` fail.
+
 ## drp/0.1 — test-vector regeneration (2026-07-21)
 
 The four canonical test vectors were regenerated and re-pinned. Cause:
